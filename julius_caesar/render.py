@@ -1,39 +1,35 @@
-"""Render the Julius Caesar TikTok video.
+"""Render the Julius Caesar TikTok video (full-screen pixel art, on-screen
+story text, music + SFX, no narration).
 
 Usage:
-  python render.py AUDIO_DIR OUT.mp4 [--workers N] [--still SCENE:T OUT.png]
-                   [--preview-scale S]
-
-AUDIO_DIR is the output of tts.py (per-scene WAVs + timing.json).
+  python render.py OUT.mp4 [--workers N] [--range START:END]
+  python render.py SHEET.png --still SCENE:T [SCENE:T ...] [--scale S]
 """
 import argparse
-import json
 import math
 import os
 import subprocess
-import sys
 import tempfile
 from multiprocessing import Pool
 
 import numpy as np
-import soundfile as sf
 from PIL import Image
 
 import captions
 import scenes
-from pixel import (FPS, H, P, SCALE, W, clamp, ease, frame, line, mix, rect,
-                   text, text_size, vgrad, BAYER4)
+from pixel import (BAYER4, FPS, H, P, SCALE, W, clamp, ease, frame, rect,
+                   text, text_size)
 from script import SCENES
 
-PRE = 0.25            # silence before each scene's narration
-TAIL = 0.45           # default silence after
-EXTRA_TAIL = {"hook": 0.25, "rubicon": 1.1, "pharsalus": 0.2, "ides": 0.9,
-              "outro": 2.6, "alesia": 0.2, "egypt": 0.4}
-TRANS = 0.3           # dither transition between scenes (inside panel)
+PRE = 0.7             # establishing time before a scene's first caption
+TAIL = 1.1            # hold after the last caption
+EXTRA_TAIL = {"hook": 0.6, "rubicon": 2.0, "pharsalus": 1.0, "alesia": 0.6,
+              "egypt": 1.0, "ides": 1.5, "outro": 3.4, "gaul": 0.8,
+              "triumvirate": 0.6, "epilogue": 0.6}
+TRANS = 0.45          # dither transition between scenes
 
-PANEL_Y = 104
-PANEL_H = 216
-CAP_Y = 330
+CAP_Y = 322           # top of the caption box (base pixels)
+CAP_CX = 128          # caption centre, nudged left of TikTok's button rail
 
 CHAPTERS = [
     ("hook", "PROLOGUE"), ("origins", "I. THE RISE"),
@@ -45,10 +41,7 @@ YEAR_MIN, YEAR_MAX = -100, -44
 
 
 class Timeline:
-    def __init__(self, audio_dir):
-        self.audio_dir = audio_dir
-        with open(os.path.join(audio_dir, "timing.json")) as f:
-            timing = json.load(f)
+    def __init__(self):
         self.items = []
         t = 0.0
         chapter = ""
@@ -56,11 +49,8 @@ class Timeline:
         for sc in SCENES:
             sid = sc["id"]
             chapter = chap.get(sid, chapter)
-            speech = timing[sid]
-            dur = PRE + speech + TAIL + EXTRA_TAIL.get(sid, 0.0)
-            x, sr = sf.read(os.path.join(audio_dir, sid + ".wav"))
-            words = captions.word_timings(sc["text"], x, sr)
-            words = [(w, a + PRE, b + PRE) for w, a, b in words]
+            words, end = captions.word_timings(sc["text"], PRE)
+            dur = end + TAIL + EXTRA_TAIL.get(sid, 0.0)
             self.items.append(dict(id=sid, start=t, dur=dur, year=sc["year"],
                                    chapter=chapter, words=words,
                                    pages=captions.pages(words)))
@@ -84,64 +74,47 @@ class Ctx:
         self.year = item["year"]
 
     def at(self, word, n=1, end=False):
-        """Scene-local time when the n-th occurrence of `word` is spoken."""
+        """Scene-local time when the n-th occurrence of `word` is read."""
         k = 0
         key = word.lower()
         for w, a, b in self.words:
-            core = w.lower().strip(".,;:?!'\"")
-            if core == key or core.startswith(key):
+            c = captions.core(w)
+            if c == key or c == key + "'s":
                 k += 1
                 if k == n:
                     return b if end else a
         raise KeyError(f"{word!r} not in scene {self.item['id']}")
 
 
-# ---------------------------------------------------------------- chrome
+# ---------------------------------------------------------------- overlays
 
-_BG = None
-
-
-def background(img, t):
-    global _BG
-    if _BG is None:
-        _BG = Image.new("RGBA", (W, H))
-        vgrad(_BG, 0, 0, W, H, [P["black"], P["night"], P["dslate"],
-                                P["night"], P["black"]])
-        # greek key bands
-        for y0 in (PANEL_Y - 4, PANEL_Y + PANEL_H + 1):
-            rect(_BG, 0, y0, W, 3, P["dgold"])
-            for x in range(0, W, 6):
-                _BG.putpixel((x, y0 + 1), P["gold"])
-                _BG.putpixel((x + 1, y0 + 1), P["gold"])
-                _BG.putpixel((x + 3, y0), P["yellow"])
-    img.paste(_BG)
-    # marching silhouettes at the bottom (decorative)
-    from sprites import figure
-    gy = 446
-    rect(img, 0, gy, W, H - gy, P["black"])
-    off = (t * 9) % 26
-    for i in range(-1, 12):
-        figure(img, int(i * 26 + off), gy, "legion", walk=t * 1.6 + i * 0.13,
-               tint=P["dslate"])
-    rect(img, 0, gy, W, 1, P["dslate"])
+def shade_band(img, y0, y1, level=0.6):
+    """Darken a horizontal band with an ordered-dither pattern so text on
+    top stays legible over any art."""
+    a = np.array(img)
+    h = y1 - y0
+    yy, xx = np.mgrid[0:h, 0:W]
+    # fade the shading in/out at the band edges
+    edge = np.minimum(yy + 1, h - yy) / 6.0
+    lv = np.clip(edge, 0, 1) * level
+    m = BAYER4[yy % 4, xx % 4] < lv
+    sub = a[y0:y1]
+    sub[m, :3] = (sub[m, :3] * 0.25).astype(np.uint8)
+    img.paste(Image.fromarray(a, img.mode))
 
 
-def hud(img, t, it, local, year_now):
-    text(img, W // 2, 44, "JULIUS CAESAR", P["yellow"], "title", 8,
+def hud(img, it, year_now):
+    shade_band(img, 34, 100, 0.85)
+    text(img, W // 2, 40, "JULIUS CAESAR", P["yellow"], "title", 8,
          anchor="c", shadow=P["wine"])
-    text(img, W // 2, 54, "THE ROAD TO THE RUBICON", P["silver"], "label", 8,
+    text(img, W // 2, 50, "THE ROAD TO THE RUBICON", P["silver"], "label", 8,
          anchor="c", spacing=0)
-    # chapter ribbon
-    ch = it["chapter"]
-    text(img, 8, 70, ch, P["gold"], "label", 8, spacing=0,
+    text(img, 8, 68, it["chapter"], P["gold"], "label", 8, spacing=0,
          shadow=P["black"])
-    # year
-    y = int(round(-year_now))
-    ys = f"{y} BC"
-    text(img, W - 8, 64, ys, P["white"], "title", 16, anchor="r",
+    ys = f"{int(round(-year_now))} BC"
+    text(img, W - 8, 62, ys, P["white"], "title", 16, anchor="r",
          shadow=P["red"])
-    # timeline bar
-    x0, x1, by = 10, W - 10, 86
+    x0, x1, by = 10, W - 10, 84
     rect(img, x0, by, x1 - x0, 3, P["dslate"])
     frac = (year_now - YEAR_MIN) / (YEAR_MAX - YEAR_MIN)
     mx = x0 + (x1 - x0) * clamp(frac)
@@ -149,13 +122,12 @@ def hud(img, t, it, local, year_now):
     for yy in (-100, -90, -80, -70, -60, -50):
         tx = x0 + (x1 - x0) * (yy - YEAR_MIN) / (YEAR_MAX - YEAR_MIN)
         rect(img, int(tx), by + 4, 1, 2, P["slate"])
-        text(img, int(tx), by + 7, str(-yy), P["slate"], "label", 8,
+        text(img, int(tx), by + 7, str(-yy), P["silver"], "label", 8,
              anchor="c", spacing=0)
     for sc in SCENES:
         tx = x0 + (x1 - x0) * (sc["year"] - YEAR_MIN) / (YEAR_MAX - YEAR_MIN)
         c = P["yellow"] if sc["year"] <= year_now + 0.01 else P["slate"]
         img.putpixel((int(tx), by - 2), c)
-    # marker
     rect(img, int(mx) - 1, by - 3, 3, 9, P["yellow"])
     rect(img, int(mx), by - 4, 1, 11, P["white"])
 
@@ -165,31 +137,41 @@ def draw_captions(img, it, local):
     cur = None
     for i, pg in enumerate(pgs):
         nxt = pgs[i + 1]["start"] if i + 1 < len(pgs) else \
-            min(it["dur"], pg["end"] + 0.8)
-        if pg["start"] - 0.05 <= local < nxt:
+            min(it["dur"] - 0.3, pg["end"] + 1.2)
+        if pg["start"] - 0.1 <= local < nxt:
             cur = pg
     if cur is None:
         return
     lh = 20
     n = len(cur["lines"])
-    y0 = CAP_Y + (2 - n) * lh // 2
-    # backing plate
-    rect(img, 4, CAP_Y - 4, W - 8, 2 * lh + 6, P["black"])
-    frame(img, 4, CAP_Y - 4, W - 8, 2 * lh + 6, P["dslate"])
+    bh = n * lh + 8
+    bw = max(text_size(" ".join(w for w, _, _ in ln), "cap",
+                       captions.CAP_SIZE)[0] for ln in cur["lines"]) + 16
+    k = ease(clamp((local - cur["start"] + 0.1) / 0.18))
+    bw2 = max(4, int(bw * k))
+    x0 = CAP_CX - bw2 // 2
+    rect(img, x0, CAP_Y, bw2, bh, P["ink"])
+    frame(img, x0, CAP_Y, bw2, bh, P["gold"])
+    frame(img, x0 + 1, CAP_Y + 1, bw2 - 2, bh - 2, P["dgold"])
+    if k < 1:
+        return
+    # quick typewriter reveal of the whole page
+    shown = int((local - cur["start"] - 0.08) * 70)
+    sp = text_size(" ", "cap", captions.CAP_SIZE)[0] + 1
     for li, ln in enumerate(cur["lines"]):
         s = " ".join(w for w, _, _ in ln)
-        lw, _ = text_size(s, "cap", 20)
-        x = (W - lw) // 2
-        y = y0 + li * lh
+        lw, _ = text_size(s, "cap", captions.CAP_SIZE)
+        x = CAP_CX - lw // 2
+        y = CAP_Y + 4 + li * lh
         for w, a, b in ln:
-            if a <= local < b + 0.05:
-                col = P["yellow"]
-            elif local >= b:
-                col = P["white"]
-            else:
-                col = P["silver"]
-            ww = text(img, x, y, w, col, "cap", 20, outline=P["ink"])
-            x += ww + text_size(" ", "cap", 20)[0] + 1
+            if shown <= 0:
+                return
+            vis = w[:shown]
+            col = P["yellow"] if captions.is_key(w) else P["white"]
+            text(img, x, y, vis, col, "cap", captions.CAP_SIZE,
+                 outline=P["black"])
+            shown -= len(w) + 1
+            x += text_size(w, "cap", captions.CAP_SIZE)[0] + sp
 
 
 def dither_wipe(a, b, x):
@@ -210,44 +192,34 @@ def dither_wipe(a, b, x):
 
 # ---------------------------------------------------------------- frame
 
-def render_panel(item, local):
-    panel = Image.new("RGBA", (W, PANEL_H), P["ink"] + (255,))
+def render_scene(item, local):
+    full = Image.new("RGBA", (W, H), P["ink"] + (255,))
     ctx = Ctx(item)
-    fn = getattr(scenes, "scene_" + item["id"])
-    fn(panel, local, ctx)
-    return panel, ctx
+    layer = scenes.begin(full)
+    getattr(scenes, "scene_" + item["id"])(layer, local, ctx)
+    scenes.flush()
+    return full, ctx
+
+
+def year_of(item, local):
+    fn = getattr(scenes, "year_" + item["id"], None)
+    return fn(local, Ctx(item)) if fn else item["year"]
 
 
 def render_frame(tl, t):
     i, it = tl.at(t)
     local = t - it["start"]
-    img = Image.new("RGBA", (W, H), P["black"] + (255,))
-    background(img, t)
-    panel, ctx = render_panel(it, local)
-    # transition from previous scene
+    img, ctx = render_scene(it, local)
     if i > 0 and local < TRANS:
         prev = tl.items[i - 1]
-        ppanel, _ = render_panel(prev, prev["dur"] + local)
-        panel = dither_wipe(ppanel, panel, local / TRANS)
-    img.alpha_composite(panel, (0, PANEL_Y))
-    # year: scenes may animate ctx.year; ease between scenes
-    year_now = ctx.year
-    if i > 0 and local < 0.6:
+        pimg, _ = render_scene(prev, prev["dur"] + local)
+        img = dither_wipe(pimg, img, local / TRANS)
+    year_now = year_of(it, local)
+    if i > 0 and local < 0.8:
         prev = tl.items[i - 1]
-        pctx = Ctx(prev)
-        try:
-            render_year = getattr(scenes, "year_" + prev["id"])
-            py = render_year(prev["dur"], pctx)
-        except AttributeError:
-            py = prev["year"]
-        yfn = getattr(scenes, "year_" + it["id"], None)
-        cy = yfn(local, ctx) if yfn else it["year"]
-        year_now = py + (cy - py) * ease(local / 0.6)
-    else:
-        yfn = getattr(scenes, "year_" + it["id"], None)
-        if yfn:
-            year_now = yfn(local, ctx)
-    hud(img, t, it, local, year_now)
+        py = year_of(prev, prev["dur"])
+        year_now = py + (year_now - py) * ease(local / 0.8)
+    hud(img, it, year_now)
     draw_captions(img, it, local)
     return img.convert("RGB")
 
@@ -262,9 +234,9 @@ def upscale(img, s=SCALE):
 _TL = None
 
 
-def _init(audio_dir):
+def _init():
     global _TL
-    _TL = Timeline(audio_dir)
+    _TL = Timeline()
 
 
 def _render_chunk(args):
@@ -286,21 +258,15 @@ def _render_chunk(args):
     return path
 
 
-def build_audio(tl, path):
-    import audio
-    audio.build(tl, path)
-
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("audio_dir")
     ap.add_argument("out")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 2)
     ap.add_argument("--still", nargs="*", help="scene:t pairs -> PNG sheet")
     ap.add_argument("--scale", type=int, default=SCALE)
     ap.add_argument("--range", help="start:end seconds (preview)")
     args = ap.parse_args()
-    tl = Timeline(args.audio_dir)
+    tl = Timeline()
     print(f"total duration {tl.total:.2f}s")
     if args.still:
         ims = []
@@ -327,19 +293,21 @@ def main():
     chunks = [(nfr0 + k * step, min(nfr1, nfr0 + (k + 1) * step),
                os.path.join(tmp, f"part{k:02d}.mp4"), args.scale)
               for k in range(n) if nfr0 + k * step < nfr1]
-    with Pool(n, initializer=_init, initargs=(args.audio_dir,)) as pool:
+    with Pool(n, initializer=_init) as pool:
         parts = pool.map(_render_chunk, chunks)
     lst = os.path.join(tmp, "list.txt")
     with open(lst, "w") as f:
         for p in parts:
             f.write(f"file '{p}'\n")
+    import audio
     wav = os.path.join(tmp, "mix.wav")
-    build_audio(tl, wav)
+    audio.build(tl, wav)
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
            "-i", lst, "-ss", f"{t0:.3f}", "-t", f"{t1 - t0:.3f}", "-i", wav,
            "-map", "0:v", "-map", "1:a", "-c:v", "copy",
-           "-af", "loudnorm=I=-14:TP=-1.5:LRA=11", "-ar", "48000", "-c:a", "aac",
-           "-b:a", "192k", "-shortest", "-movflags", "+faststart", args.out]
+           "-af", "loudnorm=I=-14:TP=-1.5:LRA=11", "-ar", "48000",
+           "-c:a", "aac", "-b:a", "192k", "-shortest",
+           "-movflags", "+faststart", args.out]
     subprocess.run(cmd, check=True)
     print("wrote", args.out)
 

@@ -1,6 +1,8 @@
-"""Scene animations. Each scene_<id>(panel, t, ctx) draws one frame of the
-270x216 story panel at scene-local time t. ctx.at(word) gives the time a
-narration word is spoken so visual beats land on the voice-over.
+"""Scene animations. Each scene_<id>(img, t, ctx) draws one full-screen frame
+at scene-local time t. Backdrops are painted on the whole 270x480 screen via
+bg(); story elements are drawn on `img`, a 270x216 layer that sits in the
+middle of the screen (top at OY). ctx.at(word) gives the time a caption word
+is read, so visual beats follow the text.
 Optional year_<id>(t, ctx) animates the HUD year."""
 import math
 import random
@@ -9,17 +11,56 @@ from functools import lru_cache
 from PIL import Image
 
 import geo
-from pixel import (BAYER4, P, bar, circle, clamp, comp, darken, dashed_path,
+import pixel as _px
+from pixel import (BAYER4, P, bar, circle, clamp, comp, dashed_path,
                    dither_mask, ease, ease_back, ease_out, frame, lerp, line,
                    mix, poly, prog, rect, shake, stamp, text, text_size,
-                   tint_overlay, vgrad)
+                   vgrad)
 from sprites import (BAG, BROKEN_HEART, COIN, CROSS, DAGGER, EAGLE, FASCES,
                      FLAG_R, HEART, LAUREL, PLOW, SCROLL, SILVER_COIN, SKULL,
                      TENT, cypress, die_face, figure, horse_rider, house,
                      mountains, palm, portrait_card, ship, small_boat, stars,
                      temple, torch, tree)
 
-PW, PH = 270, 216
+PW, PH = 270, 216     # story layer
+FH = 480              # full screen height
+OY = 96               # story layer top on the full screen
+
+
+class _Stage:
+    full = None
+    layer = None
+
+
+STAGE = _Stage()
+
+
+def begin(full):
+    STAGE.full = full
+    STAGE.layer = Image.new("RGBA", (PW, PH), (0, 0, 0, 0))
+    return STAGE.layer
+
+
+def flush():
+    """Composite what has been drawn on the story layer onto the screen."""
+    if STAGE.layer is None:
+        return
+    STAGE.full.alpha_composite(STAGE.layer, (0, OY))
+    STAGE.layer.paste((0, 0, 0, 0), (0, 0, PW, PH))
+
+
+def bg():
+    """The full screen, with everything drawn so far composited."""
+    flush()
+    return STAGE.full
+
+
+def darken(img, amount, box=None):
+    _px.darken(bg(), amount)
+
+
+def tint_overlay(img, color, amount):
+    _px.tint_overlay(bg(), color, amount)
 
 # ================================================================ helpers
 
@@ -230,17 +271,21 @@ def sparkle(img, x, y, t, seed=0, col=None):
 
 
 def sky(img, stops, h):
-    vgrad(img, 0, 0, PW, h, stops)
+    """Sky gradient from the top of the screen down to layer row h."""
+    vgrad(bg(), 0, 0, PW, OY + h, stops)
 
 
 def ground(img, y, c1, c2, h=None):
-    h = h or PH - y
-    rect(img, 0, y, PW, h, c1)
-    m = dither_mask(PW, h, 0.18)
+    """Dithered ground from layer row y to the bottom of the screen."""
     import numpy as np
-    a = np.array(img)
+    b = bg()
+    y = OY + y
+    h = FH - y
+    rect(b, 0, y, PW, h, c1)
+    m = dither_mask(PW, h, 0.18)
+    a = np.array(b)
     a[y:y + h][m] = (*c2, 255)
-    img.paste(Image.fromarray(a, img.mode))
+    b.paste(Image.fromarray(a, b.mode))
 
 
 def rome_skyline(img, base, t, col=None, lit=False):
@@ -255,7 +300,7 @@ def rome_skyline(img, base, t, col=None, lit=False):
         house(img, hx, base - 12 - (i % 2) * 3, w=12, h=8)
     for cx in (8, 46, 96, 165, 205, 262):
         cypress(img, cx, base - 10, 16)
-    rect(img, 0, base, PW, PH - base, P["dgrass"])
+    rect(bg(), 0, OY + base, PW, FH - OY - base, P["dgrass"])
 
 
 def river_x(y, top=130, xl=(150, 120), xr=(162, 205)):
@@ -269,33 +314,38 @@ def river_scene(img, t, dawn=0.0, moon=True):
     top = mix(P["night"], P["navy"], dawn)
     mid = mix(P["navy"], P["plum"], dawn)
     hor = mix(P["plum"], P["orange"], dawn)
-    sky(img, [top, mid, hor], 130)
+    sky(img, [top, top, mid, hor], 130)
+    b = bg()
     if dawn < 0.7:
-        stars(img, PW, 90, t, n=int(50 * (1 - dawn)))
+        stars(b, PW, OY + 90, t, n=int(110 * (1 - dawn)))
     if moon:
-        circle(img, 222, 30, 9, P["marble"])
-        circle(img, 226, 27, 9, top) if dawn < 0.2 else None
-    poly(img, [(0, 130), (0, 112), (40, 104), (90, 114), (130, 100),
-               (180, 110), (230, 98), (270, 108), (270, 130)], P["dslate"])
-    poly(img, [(0, 130), (0, 122), (60, 116), (120, 124), (170, 118),
-               (220, 124), (270, 116), (270, 130)], P["forest"])
+        circle(b, 222, 150, 11, P["marble"])
+        circle(b, 227, 146, 11, top) if dawn < 0.2 else None
+    poly(b, [(x, y + OY) for x, y in
+             [(0, 130), (0, 112), (40, 104), (90, 114), (130, 100),
+              (180, 110), (230, 98), (270, 108), (270, 130)]], P["dslate"])
+    poly(b, [(x, y + OY) for x, y in
+             [(0, 130), (0, 122), (60, 116), (120, 124), (170, 118),
+              (220, 124), (270, 116), (270, 130)]], P["forest"])
     ground(img, 130, P["dgrass"], P["forest"])
-    # river
-    pts = [(150, 130), (162, 130), (205, PH), (120, PH)]
-    poly(img, pts, P["navy"])
-    for k in range(14):
-        yy = 130 + ((k * 7 + t * 14) % (PH - 130))
-        a, b = river_x(yy)
-        span = b - a
+    # river (layer coordinates extended past the layer to the screen bottom)
+    bot = FH - OY
+    xl, xr = river_x(bot)
+    poly(b, [(150, 130 + OY), (162, 130 + OY), (xr, FH), (xl, FH)],
+         P["navy"])
+    for k in range(34):
+        yy = 130 + ((k * 7.3 + t * 18) % (bot - 130))
+        a, c = river_x(yy)
+        span = c - a
         x0 = a + span * ((k * 0.37) % 0.7)
-        line(img, x0, yy, x0 + max(2, span * 0.18), yy, P["blue"])
+        line(b, x0, yy + OY, x0 + max(2, span * 0.15), yy + OY, P["blue"])
         if k % 3 == 0:
-            img.putpixel((int(x0 + 1), int(yy)), P["sky"])
-    # banks
-    for yy in range(130, PH):
-        a, b = river_x(yy)
-        img.putpixel((int(a), yy), P["dbrown"])
-        img.putpixel((int(b), yy), P["dbrown"])
+            b.putpixel((int(x0 + 1), int(yy + OY)), P["sky"])
+    for yy in range(130, bot):
+        a, c = river_x(yy)
+        for xx in (a, c):
+            if 0 <= xx < PW:
+                b.putpixel((int(xx), yy + OY), P["dbrown"])
 
 
 def splash(img, x, y, t, seed=0):
@@ -320,6 +370,23 @@ def cohort(img, x, y, w, h, col, dark, t=0.0, seed=0, cav=False):
 
 # ================================================================ scenes
 
+def front_army(t, march=0.0, moving=False):
+    """Big foreground ranks on the near bank, filling the lower screen.
+    march: 0..1 how far they have advanced (and waded) toward Italy."""
+    b = bg()
+    for row, fy in enumerate((372, 418, 468)):
+        sc = 2 if row < 2 else 3
+        for i in range(5):
+            x0 = -14 + i * (22 if sc == 2 else 30) + (row % 2) * 10
+            x = x0 + march * (90 + row * 10) * clamp(1 - i * 0.08)
+            a, c = river_x(fy - OY)
+            inw = a + 4 < x < c - 4
+            figure(b, x, fy, "legion",
+                   walk=t * 1.6 + i * 0.3 if moving else None, scale=sc,
+                   wade=5 if inw else 0)
+        torch(b, 6 + row * 30, fy - 34 * (row + 1) // 2 - 20, t, seed=row)
+
+
 def scene_hook(img, t, ctx):
     river_scene(img, t, dawn=0.0)
     # legion waiting on the near bank
@@ -329,6 +396,7 @@ def scene_hook(img, t, ctx):
             figure(img, x, yy, "legion", facing=1)
         torch(img, 10 + row * 24, yy - 16, t, seed=row)
     horse_rider(img, 100, 198, t * 0.3, rider="general")
+    front_army(t)
     # signpost on the far bank
     rect(img, 224, 160, 2, 16, P["dbrown"])
     rect(img, 212, 154, 28, 8, P["sand"])
@@ -364,6 +432,9 @@ def scene_origins(img, t, ctx):
     sky(img, [P["sky"], P["cyan"], P["white"]], 180)
     circle(img, 236, 26, 10, P["yellow"])
     rome_skyline(img, 200, t)
+    for cx in (20, 70, 200, 250):
+        cypress(bg(), cx, FH - 66, 26)
+    street(t, FH - 56)
     tag(img, "ROME, 100 BC", t, 0.1, right=True)
     # Venus -> Caesar lineage
     t_v = ctx.at("Venus")
@@ -409,6 +480,10 @@ def scene_sulla(img, t, ctx):
     sky(img, [P["wine"], P["red"], P["orange"]], 216)
     rome_skyline(img, 214, t, col=P["wine"])
     darken(img, 0.25)
+    if t < ctx.at("hid"):
+        marching(t, FH - 24, n=5, scale=3, speed=14, facing=-1, spacing=56)
+        lbl(img, 135, 206, "SULLA'S MEN HUNT HIS ENEMIES", P["white"],
+            P["wine"], None, t=prog(t, 0.6, 0.3))
     card(img, 8, 8, "sulla", prog(t, 0.1, 0.35), 2, mood="angry")
     lbl(img, 42, 92, "DICTATOR", P["white"], P["red"], P["wine"],
         t=prog(t, ctx.at("Sulla"), 0.3))
@@ -453,30 +528,32 @@ def scene_sulla(img, t, ctx):
     if t > t_h:
         # flight into the hills at night
         k = prog(t, t_h, 0.3)
-        rect(img, 0, 160, PW, 56, P["night"])
-        stars(img, PW, 20, t, n=10) if False else None
-        poly(img, [(0, 216), (0, 186), (50, 172), (110, 184), (170, 166),
-                   (230, 180), (270, 170), (270, 216)], P["forest"])
+        b = bg()
+        rect(b, 0, OY + 160, PW, FH - OY - 160, P["night"])
+        poly(b, [(x, y + OY) for x, y in
+                 [(0, 384), (0, 186), (50, 172), (110, 184), (170, 166),
+                  (230, 180), (270, 170), (270, 384)]], P["forest"])
         for bx in (40, 120, 200):
             circle(img, bx, 196, 6, P["dgrass"])
         x = lerp(10, 250, prog(t, t_h, 2.2))
         figure(img, x, 206, "caesar", walk=t * 3)
         lbl(img, 80, 166, "ON THE RUN, SICK WITH FEVER", P["silver"], P["ink"],
             None, t=k)
-    t_p = ctx.at("pardon")
+    t_p = ctx.at("pardoned")
     if t > t_p:
         stamp(img, 200, 188, "PARDONED", P["lime"], prog(t, t_p, 0.4), 8)
 
 
 def scene_pirates(img, t, ctx):
     sky(img, [P["plum"], P["red"], P["orange"], P["yellow"]], 130)
-    circle(img, 200, 130, 16, P["yellow"])
-    rect(img, 0, 128, PW, 88, P["navy"])
-    for k in range(40):
-        yy = 130 + (k * 37) % 86
+    b = bg()
+    circle(b, 200, OY + 130, 16, P["yellow"])
+    rect(b, 0, OY + 128, PW, FH - OY - 128, P["navy"])
+    for k in range(110):
+        yy = 130 + (k * 37) % (FH - OY - 130)
         xx = (k * 53 + t * (8 + yy * 0.05)) % (PW + 20) - 10
-        line(img, xx, yy, xx + 4 + (yy - 128) // 12, yy,
-             P["blue"] if k % 3 else P["orange"])
+        line(b, xx, yy + OY, xx + 4 + (yy - 128) // 12, yy + OY,
+             P["blue"] if k % 3 else (P["orange"] if yy < 200 else P["sky"]))
     t_hunt = ctx.at("hunted")
     flee = ease(prog(t, t_hunt, 2.0)) * 60
     ship(img, 150 + flee, 172, t, sail=P["ink"], hull=P["dbrown"],
@@ -510,12 +587,16 @@ def scene_pirates(img, t, ctx):
         ship(img, x, 178, t + 1, sail=P["red"], flag=P["gold"], scale=2)
         lbl(img, x, 112, "ROMAN FLEET", P["white"], P["red"], None,
             t=prog(t, t_hunt + 0.3, 0.3))
+    if t > t_hunt:
+        fx = lerp(-120, 330, prog(t, t_hunt - 0.3, 5.0))
+        ship(bg(), fx, FH - 40, t * 1.3, sail=P["red"], flag=P["gold"],
+             scale=3)
     t_cr = ctx.at("crucified")
     if t > t_cr:
         k = prog(t, t_cr, 0.4)
         darken(img, 0.5 * k)
-        poly(img, [(212, 216), (220, 150), (240, 140), (270, 136), (270, 216)],
-             P["black"])
+        poly(bg(), [(212, FH), (220, OY + 150), (240, OY + 140),
+                    (270, OY + 136), (270, FH)], P["black"])
         for i, cx in enumerate((232, 246, 260)):
             if t > t_cr + i * 0.2:
                 CROSS.blit(img, cx - 2, 128 + (i % 2) * 2, scale=2,
@@ -525,10 +606,16 @@ def scene_pirates(img, t, ctx):
 
 
 def scene_ladder(img, t, ctx):
-    vgrad(img, 0, 0, PW, PH, [P["dslate"], P["slate"], P["dslate"]])
+    b = bg()
+    vgrad(b, 0, 0, PW, FH, [P["dslate"], P["slate"], P["dslate"]])
     for cx in (6, 264):
-        rect(img, cx - 4, 0, 8, PH, P["marble"])
-        line(img, cx + 2, 0, cx + 2, PH, P["stone"])
+        rect(b, cx - 4, 0, 8, FH, P["marble"])
+        line(b, cx + 2, 0, cx + 2, FH, P["stone"])
+    rect(b, 0, OY + 206, PW, FH - OY - 206, P["marble"])
+    for y in range(OY + 214, FH, 14):
+        line(b, 0, y, PW, y, P["stone"])
+        for x in range((y // 14 % 2) * 14, PW, 28):
+            line(b, x, y, x, y + 13, P["stone"])
     steps = [("QUAESTOR", "69 BC"), ("AEDILE", "65 BC"), ("PONTIFEX", "63 BC"),
              ("PRAETOR", "62 BC"), ("CONSUL", "59 BC")]
     sx0, sw, sh, base = 50, 42, 24, 206
@@ -544,7 +631,6 @@ def scene_ladder(img, t, ctx):
              spacing=0)
         text(img, x + sw // 2, y + 14, yr, P["red"] if not dim else P["slate"],
              "label", 8, anchor="c", spacing=0)
-    rect(img, 10, base, PW - 20, PH - base, P["marble"])
     # Caesar hopping up to step 3
     t_pm = ctx.at("Pontifex")
     hops = [0.6, 1.8, t_pm - 0.3]
@@ -605,10 +691,19 @@ TRI_C = {k: (x + 36, y + 36) for k, (x, y) in TRI.items()}
 
 
 def plum_bg(img, t):
-    vgrad(img, 0, 0, PW, PH, [P["ink"], P["plum"], P["ink"]])
-    for y in range(4, PH, 12):
+    b = bg()
+    vgrad(b, 0, 0, PW, FH, [P["ink"], P["plum"], P["purple"], P["plum"],
+                            P["ink"]])
+    for y in range(4, FH, 12):
         for x in range((y // 12) % 2 * 6, PW, 12):
-            img.putpixel((x, y), P["purple"])
+            b.putpixel((x, y), P["purple"] if 120 < y < 360 else P["plum"])
+    # faint rotating laurel ring behind the pact
+    for i in range(36):
+        a = i / 36 * 6.283 + t * 0.15
+        x = 135 + math.cos(a) * 128
+        y = OY + 108 + math.sin(a) * 128
+        if 0 <= x < PW and 0 <= y < FH and i % 2 == 0:
+            b.putpixel((int(x), int(y)), P["dgold"])
 
 
 def tri_lines(img, t, p=1.0, broken=(), col=None):
@@ -702,11 +797,15 @@ def scene_deal(img, t, ctx):
 
 
 def scene_consul(img, t, ctx):
-    sky(img, [P["sky"], P["cyan"]], 120)
+    sky(img, [P["sky"], P["sky"], P["cyan"]], 120)
     temple(img, 70, 140, w=130, h=90, cols=8)
-    rect(img, 0, 140, PW, 76, P["stone"])
-    for x in range(0, PW, 12):
-        line(img, x, 140, x - 20, 216, P["dstone"])
+    b = bg()
+    rect(b, 0, OY + 140, PW, FH - OY - 140, P["stone"])
+    k = (FH - OY - 140) / 76
+    for x in range(-200, PW + 200, 12):
+        line(b, x, OY + 140, x - 20 * k, FH, P["dstone"])
+    for y in (OY + 160, OY + 190, OY + 230, OY + 290, OY + 360):
+        line(b, 0, y, PW, y, P["dstone"])
     # rostra
     rect(img, 108, 168, 54, 14, P["marble"])
     rect(img, 108, 168, 54, 2, P["white"])
@@ -736,9 +835,9 @@ def scene_consul(img, t, ctx):
                      spacing=0)
                 lbl(img, 118, 23 + i * 9, "OK", P["ink"], P["lime"], None,
                     t=prog(t, ti + 0.15, 0.25))
-    if t > ctx.at("brazenly"):
+    if t > ctx.at("bulldozed"):
         lbl(img, 135, 156, "BY FORCE!", P["white"], P["red"], None,
-            t=prog(t, ctx.at("brazenly"), 0.3))
+            t=prog(t, ctx.at("bulldozed"), 0.3))
     # Bibulus goes home
     if t > t_b - 0.2:
         house(img, 228, 196, w=30, h=22)
@@ -784,7 +883,13 @@ def _gaul_masks(vkey):
     return gaul, prov, dist
 
 
+def full_view(v):
+    """Full-screen view whose layer region matches the 270x216 view v."""
+    return geo.View(v.lon0, v.lat1 + OY / v.ppd, v.ppd, PW, FH)
+
+
 def map_base(view, t, rivers=(), alps=True, pyrenees=False):
+    view = full_view(view)
     img = geo.render_map(view, t).convert("RGBA")
     geo.draw_rivers(img, view, rivers)
     if alps:
@@ -802,11 +907,11 @@ def scene_gaul(img, t, ctx):
     v = GAUL_VIEW
     m = map_base(v, t, ("rhine", "rhone", "loire", "seine", "po"),
                  pyrenees=True)
-    gaul, prov, dist = _gaul_masks(v.key())
+    gaul, prov, dist = _gaul_masks(full_view(v).key())
     geo.overlay_region(m, prov, P["red"], 1)
     r = 260 * ease(prog(t, 0.6, ctx.dur - 1.6))
     geo.overlay_region(m, gaul & (dist < r), P["red"], 2)
-    comp(img, m, (0, 0))
+    comp(bg(), m, (0, 0))
     gx, gy = place(v, "geneva")
     lbl(img, gx + 30, gy + 30, "ROMAN PROVINCE", P["white"], P["wine"], None,
         t=prog(t, 0.3, 0.3))
@@ -849,13 +954,26 @@ def year_gaul(t, ctx):
     return -58 + 7 * clamp(prog(t, 0.6, ctx.dur - 1.6))
 
 
-def scene_alesia(img, t, ctx):
+def grass_bg(t, seed=11):
+    """Top-down field filling the screen, with scattered trees."""
     import numpy as np
-    rect(img, 0, 0, PW, PH, P["grass"])
-    m = dither_mask(PW, PH, 0.25)
-    a = np.array(img)
+    b = bg()
+    rect(b, 0, 0, PW, FH, P["grass"])
+    m = dither_mask(PW, FH, 0.25)
+    a = np.array(b)
     a[m] = (*P["dgrass"], 255)
-    img.paste(Image.fromarray(a, "RGBA"))
+    b.paste(Image.fromarray(a, "RGBA"))
+    rnd = random.Random(seed)
+    for i in range(70):
+        x, y = rnd.randrange(PW), rnd.randrange(FH)
+        if OY + 10 < y < OY + 206 and 20 < x < 250:
+            continue
+        circle(b, x, y, 2 + rnd.randrange(2), P["forest"])
+        b.putpixel((x - 1, y - 1), P["green"])
+
+
+def scene_alesia(img, t, ctx):
+    grass_bg(t)
     cx, cy = 135, 116
     # rivers
     for off in (-34, 34):
@@ -937,7 +1055,12 @@ def scene_alesia(img, t, ctx):
 
 
 def scene_legions(img, t, ctx):
-    vgrad(img, 0, 0, PW, PH, [P["ink"], P["dslate"], P["slate"]])
+    b = bg()
+    vgrad(b, 0, 0, PW, FH, [P["ink"], P["dslate"], P["slate"], P["dslate"]])
+    rect(b, 0, OY + 210, PW, FH - OY - 210, P["marble"])
+    for i, y in enumerate((OY + 216, OY + 224, OY + 236)):
+        line(b, 0, y, PW, y, P["stone"])
+    checker_floor(b, OY + 240, P["stone"], P["marble"])
     card(img, 8, 6, "caesar", prog(t, 0.1, 0.3))
     t_r, t_p, t_l = ctx.at("rich"), ctx.at("popular"), ctx.at("legions")
     rows = [("WEALTH", t_r, P["gold"]), ("POPULARITY", t_p, P["lime"])]
@@ -952,10 +1075,14 @@ def scene_legions(img, t, ctx):
         n = int(clamp((t - t_l + 0.3) / 0.08, 0, 10))
         for i in range(n):
             EAGLE.blit(img, 88 + i * 17, 62)
+    if t > t_l - 0.3:
+        marching(t, FH - 70, n=9, scale=2, speed=16, spacing=30,
+                 start=t_l)
+        marching(t, FH - 20, n=7, scale=3, speed=22, spacing=40,
+                 start=t_l)
     # the Senate trembles
     t_s = ctx.at("Senate")
     base = 212
-    rect(img, 0, base - 2, PW, 8, P["marble"])
     sx, sy = shake(t, t_s, 1.5, 2)
     temple(img, 70 + sx, base - 2 + sy, w=130, h=100, cols=8)
     for i in range(7):
@@ -1031,15 +1158,58 @@ def year_collapse(t, ctx):
 
 
 def senate_bg(img, t, tint=None):
-    vgrad(img, 0, 0, PW, PH, [P["wine"], P["plum"], P["ink"]])
+    b = bg()
+    fy = OY + 170
+    vgrad(b, 0, 0, PW, fy, [P["ink"], P["wine"], P["plum"], P["ink"]])
     for x in range(14, PW, 48):
-        rect(img, x - 5, 0, 10, 170, P["marble"])
-        line(img, x + 3, 0, x + 3, 170, P["stone"])
-        rect(img, x - 7, 0, 14, 4, P["marble"])
-        rect(img, x - 7, 166, 14, 4, P["marble"])
-    rect(img, 0, 170, PW, 46, P["dstone"])
-    for x in range(0, PW, 16):
-        rect(img, x, 170 + (x // 16 % 2) * 23, 16, 23, P["stone"])
+        rect(b, x - 5, 0, 10, fy, P["marble"])
+        line(b, x + 3, 0, x + 3, fy, P["stone"])
+        rect(b, x - 7, fy - 4, 14, 4, P["marble"])
+    checker_floor(b, fy)
+
+
+def checker_floor(b, fy, c1=None, c2=None):
+    """Perspective checkerboard floor from fy to the screen bottom."""
+    import numpy as np
+    c1 = np.array(c1 or P["dstone"])
+    c2 = np.array(c2 or P["stone"])
+    a = np.array(b)
+    vy = fy - 60.0
+    yy, xx = np.mgrid[fy:FH, 0:PW]
+    d = yy - vy
+    row = np.floor(np.log(d / 60.0) / np.log(1.22)).astype(int)
+    u = np.floor((xx - 135) / (d * 0.32)).astype(int)
+    m = (row + u) % 2 == 0
+    a[fy:FH, :, :3] = np.where(m[..., None], c2, c1)
+    b.paste(Image.fromarray(a, b.mode))
+
+
+def street(t, y0, kinds=("civil", "senator", "civil", "legion")):
+    """Foreground Roman road with passers-by (screen coordinates)."""
+    b = bg()
+    rect(b, 0, y0, PW, 26, P["stone"])
+    for x in range(0, PW, 9):
+        for r in range(3):
+            rect(b, x + (r % 2) * 4, y0 + 2 + r * 8, 8, 7, P["dstone"]
+                 if (x // 9 + r) % 3 == 0 else P["stone"])
+            line(b, x + (r % 2) * 4, y0 + 1 + r * 8, x + (r % 2) * 4 + 8,
+                 y0 + 1 + r * 8, P["dstone"])
+    for i, k in enumerate(kinds):
+        sp = 9 + i * 3
+        x = (i * 83 + t * sp * (1 if i % 2 else -1)) % (PW + 40) - 20
+        figure(b, x, y0 + 20, k, facing=1 if i % 2 else -1, walk=t * 1.5 + i,
+               scale=2)
+
+
+def marching(t, y, n=6, scale=2, kind="legion", speed=10, facing=1,
+             spacing=24, start=0.0):
+    b = bg()
+    for i in range(n):
+        x = (i * spacing + (t - start) * speed * facing) % (n * spacing) - 20
+        if facing < 0:
+            x = PW - x
+        figure(b, x, y, kind, facing=facing, walk=t * 1.4 + i * 0.5,
+               scale=scale)
 
 
 def scene_ultimatum(img, t, ctx):
@@ -1104,7 +1274,7 @@ def scene_rubicon(img, t, ctx):
         lbl(img, 156, 122, "RUBICON", P["cyan"], P["ink"], None,
             t=prog(t, t_r, 0.3))
     # crossing
-    hx = lerp(100, 236, ease(prog(t, t_cr - 0.2, 3.0)))
+    hx = lerp(100, 236, ease(prog(t, t_cr - 0.6, 3.6)))
     hy = 198
 
     def wade_for(x, y):
@@ -1116,11 +1286,11 @@ def scene_rubicon(img, t, ctx):
         for i in range(5):
             x0 = 14 + i * 14 + (row % 2) * 7
             delay = 0.5 + (4 - i) * 0.12 + row * 0.2
-            x = x0 + 130 * ease(prog(t, t_cr + delay, 3.4))
+            x = x0 + 130 * ease(prog(t, t_cr + delay, 4.0))
             soldiers.append((yy, x, row, i))
     for yy, x, row, i in sorted(soldiers):
         inw, _ = wade_for(x, yy)
-        moving = t_cr + 0.5 < t < t_cr + 4.5
+        moving = t_cr + 0.5 < t < t_cr + 5.2
         figure(img, x, yy, "legion", walk=t * 1.8 + i * 0.3 if moving else None,
                wade=5 if inw else 0)
         if inw:
@@ -1130,9 +1300,11 @@ def scene_rubicon(img, t, ctx):
                 wade=7 if inw else 0)
     if inw:
         splash(img, hx, hy - 6, t, 99)
+    front_army(t, ease(prog(t, t_cr + 0.8, 4.4)),
+               moving=t_cr + 0.8 < t < t_cr + 5.2)
     # eagle of the XIII
     t_13 = ctx.at("Thirteenth")
-    ex = 60 + 130 * ease(prog(t, t_cr + 0.6, 3.4))
+    ex = 60 + 130 * ease(prog(t, t_cr + 0.6, 4.0))
     if t > t_13 - 0.2:
         EAGLE.blit(img, ex, 162, anchor="bc")
         lbl(img, ex, 136, "LEGIO XIII", P["yellow"], P["ink"], None,
@@ -1175,7 +1347,7 @@ ITALY_VIEW = geo.View.centered(14.6, 42.2, 25)
 def scene_italy(img, t, ctx):
     v = ITALY_VIEW
     m = map_base(v, t, ("po", "rubicon"))
-    comp(img, m, (0, 0))
+    comp(bg(), m, (0, 0))
     P_ = {k: place(v, k) for k in ("rubicon", "ariminum", "rome", "corfinium",
                                    "brundisium", "dyrrhachium")}
     pin(img, *P_["rome"], P["yellow"], prog(t, 0.2, 0.4), "ROMA", below=True)
@@ -1233,7 +1405,7 @@ SPAIN_VIEW = geo.View.centered(4.5, 42.4, 12.5)
 
 def scene_spain(img, t, ctx):
     v = SPAIN_VIEW
-    comp(img, map_base(v, t, ("rhone", "ebro", "po"), pyrenees=True), (0, 0))
+    comp(bg(), map_base(v, t, ("rhone", "ebro", "po"), pyrenees=True), (0, 0))
     pts = [place(v, "rome"), place(v, "ariminum"), v.xy(9.0, 44.5),
            v.xy(7.3, 43.7), place(v, "massilia"), v.xy(3.1, 43.2),
            v.xy(2.4, 42.3), place(v, "ilerda")]
@@ -1277,7 +1449,7 @@ GREECE_VIEW = geo.View.centered(20.4, 40.4, 30)
 
 def scene_dyrrhachium(img, t, ctx):
     v = GREECE_VIEW
-    comp(img, map_base(v, t, (), alps=False), (0, 0))
+    comp(bg(), map_base(v, t, (), alps=False), (0, 0))
     bx, by = place(v, "brundisium")
     dx, dy = place(v, "dyrrhachium")
     px_, py_ = place(v, "pharsalus")
@@ -1314,13 +1486,13 @@ def scene_dyrrhachium(img, t, ctx):
                 img.putpixel((int(cx + 30 + d), int(cy + 26 - d)), P["red"])
             lbl(img, cx + 48, cy + 20, "CAESAR BEATEN", P["white"], P["red"],
                 None, t=k)
-    t_e = ctx.at("enemy")
+    t_e = ctx.at("finish") + 0.3
     if t > t_e - 0.2:
         lines = ['"THE ENEMY WOULD HAVE WON',
                  'TODAY, IF THEY HAD A COMMANDER',
                  'WHO KNEW HOW TO WIN."', '- CAESAR, VIA PLUTARCH']
         textbox(img, 6, 164, 172, lines, t, t0=t_e - 0.2, cps=40, lh=9)
-    t_f = ctx.at("finish")
+    t_f = ctx.at("Thessaly") - 0.6
     if t > t_f:
         route(img, [(cx, cy), v.xy(21.0, 40.0), (px_, py_)],
               ease(prog(t, t_f, 1.6)), P["red"], t=t)
@@ -1329,18 +1501,14 @@ def scene_dyrrhachium(img, t, ctx):
 
 
 def scene_pharsalus(img, t, ctx):
-    import numpy as np
-    rect(img, 0, 0, PW, PH, P["grass"])
-    m = dither_mask(PW, PH, 0.2)
-    a = np.array(img)
-    a[m] = (*P["dgrass"], 255)
-    img.paste(Image.fromarray(a, "RGBA"))
+    grass_bg(t, seed=21)
+    b = bg()
     # river Enipeus on the left
-    for y in range(0, PH, 2):
-        x = 10 + math.sin(y / 18) * 4
-        rect(img, x, y, 6, 2, P["blue"])
+    for y in range(0, FH, 2):
+        x = 10 + math.sin((y - OY) / 18) * 4
+        rect(b, x, y, 6, 2, P["blue"])
         if (y + int(t * 10)) % 12 == 0:
-            img.putpixel((int(x + 2), y), P["cyan"])
+            b.putpixel((int(x + 2), y), P["cyan"])
     # camps
     for i in range(4):
         TENT.blit(img, 100 + i * 14, 32)
@@ -1446,13 +1614,21 @@ def scene_pharsalus(img, t, ctx):
 def scene_egypt(img, t, ctx):
     sky(img, [P["orange"], P["yellow"], P["sand"]], 130)
     circle(img, 60, 120, 14, P["white"])
-    rect(img, 0, 128, PW, 88, P["teal"])
-    for k in range(30):
-        yy = 130 + (k * 29) % 86
+    b = bg()
+    rect(b, 0, OY + 128, PW, FH - OY - 128, P["teal"])
+    for k in range(90):
+        yy = 130 + (k * 29) % (FH - OY - 130)
         xx = (k * 47 + t * 10) % (PW + 20) - 10
-        line(img, xx, yy, xx + 5, yy, P["cyan"])
-    poly(img, [(150, 216), (190, 140), (270, 132), (270, 216)], P["sand"])
-    poly(img, [(150, 216), (190, 140), (196, 140), (160, 216)], P["dsand"])
+        line(b, xx, yy + OY, xx + 5 + yy // 60, yy + OY, P["cyan"])
+    poly(b, [(62, FH), (190, OY + 140), (270, OY + 132), (270, FH)],
+         P["sand"])
+    poly(b, [(62, FH), (190, OY + 140), (196, OY + 140), (80, FH)],
+         P["dsand"])
+    for k in range(30):
+        x = 140 + (k * 37) % 130
+        y = OY + 150 + (k * 53) % (FH - OY - 150)
+        if x > 190 - (y - OY - 140) * 0.76 + 6:
+            b.putpixel((x, y), P["dsand"])
     # Egyptian pylon / fort at Pelusium
     rect(img, 226, 96, 34, 40, P["dsand"])
     poly(img, [(222, 136), (230, 92), (256, 92), (264, 136)], P["sand"])
@@ -1515,7 +1691,7 @@ MED_VIEW = geo.View(-10.0, 56.4, 7.73)
 
 def scene_epilogue(img, t, ctx):
     v = MED_VIEW
-    comp(img, map_base(v, t, ("nile", "rhine", "po")), (0, 0))
+    comp(bg(), map_base(v, t, ("nile", "rhine", "po")), (0, 0))
     stops = [("alexandria", "Egypt", "ALEXANDRIA 48-47", P["yellow"]),
              ("zela", "Zela", "ZELA 47", P["red"]),
              ("thapsus", "Thapsus", "THAPSUS 46", P["red"]),
@@ -1561,15 +1737,13 @@ def year_epilogue(t, ctx):
 
 
 def scene_ides(img, t, ctx):
-    vgrad(img, 0, 0, PW, PH, [P["dslate"], P["plum"], P["ink"]])
+    b = bg()
+    fy = OY + 160
+    vgrad(b, 0, 0, PW, fy, [P["ink"], P["dslate"], P["plum"], P["ink"]])
     for x in range(20, PW, 46):
-        rect(img, x - 6, 0, 12, 160, P["marble"])
-        line(img, x + 4, 0, x + 4, 160, P["stone"])
-    rect(img, 0, 160, PW, 56, P["dstone"])
-    for x in range(0, PW, 18):
-        for y in range(160, PH, 14):
-            if (x // 18 + y // 14) % 2:
-                rect(img, x, y, 18, 14, P["stone"])
+        rect(b, x - 6, 0, 12, fy, P["marble"])
+        line(b, x + 4, 0, x + 4, fy, P["stone"])
+    checker_floor(b, fy)
     # statue of Pompey
     rect(img, 210, 150, 40, 30, P["marble"])
     rect(img, 206, 148, 48, 4, P["white"])
@@ -1619,8 +1793,9 @@ def scene_ides(img, t, ctx):
 
 
 def scene_outro(img, t, ctx):
-    vgrad(img, 0, 0, PW, PH, [P["black"], P["night"], P["navy"]])
-    stars(img, PW, PH, t, 60, seed=3)
+    b = bg()
+    vgrad(b, 0, 0, PW, FH, [P["black"], P["night"], P["navy"], P["night"]])
+    stars(b, PW, FH, t, 130, seed=3)
     t1, t2, t3 = ctx.at("One"), ctx.at("Five"), ctx.at("Republic")
     tiles = [(t1, "1", "RIVER CROSSED", "RUBICON, 49 BC", P["sky"]),
              (t2, "5", "YEARS OF CIVIL WAR", "49 - 45 BC", P["red"]),

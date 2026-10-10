@@ -21,7 +21,7 @@ INTENSITY = {
 SFX = [
     ("hook", "Cross", "boom"), ("hook", "How", "chime"),
     ("origins", "Venus", "chime"), ("sulla", "refused", "blip"),
-    ("sulla", "pardon", "stamp"), ("pirates", "50", "coins"),
+    ("sulla", "pardoned", "stamp"), ("pirates", "50", "coins"),
     ("pirates", "crucified", "boom"), ("ladder", "Pontifex", "chime"),
     ("triumvirate", "Pompey", "blip"), ("triumvirate", "Crassus", "blip"),
     ("triumvirate", "First", "boom"), ("deal", "married", "chime"),
@@ -111,6 +111,16 @@ PROG = [(50, (0, 3, 7)), (46, (0, 4, 7)), (48, (0, 4, 7)), (45, (0, 4, 7))]
 SAD = [(50, (0, 3, 7)), (43, (0, 3, 7)), (46, (0, 4, 7)), (45, (0, 4, 7))]
 
 
+# Lead melody over the Dm-Bb-C-A loop: semitones above D4, None = rest.
+LEAD = [
+    [7, None, 5, 3, 2, None, 0, None], [3, None, 5, 7, 8, None, 7, 5],
+    [7, None, 10, 7, 5, None, 3, 2], [14, None, 11, None, 7, None, None, None],
+    [12, None, 10, 8, 7, None, 5, None], [5, 7, 8, None, 10, None, 8, 7],
+    [7, None, 5, None, 3, 2, 0, None], [2, None, -1, None, -5, None, None,
+                                         None],
+]
+
+
 def music(tl):
     total = tl.total + 1.0
     buf = np.zeros(int(total * SR))
@@ -140,6 +150,13 @@ def music(tl):
             for s, k in enumerate(arp):
                 add(buf, pulse(midi(root + 24 + k), BEAT / 4 * 0.8, 0.125,
                                0.022, decay=8), t0 + s * BEAT / 4)
+        if inten in (1, 2) and (b // 8) % 3 != 2:
+            # lead melody (rests every third 8-bar block for breathing room)
+            for e, k in enumerate(LEAD[b % 8]):
+                if k is not None:
+                    add(buf, pulse(midi(62 + k), BEAT / 2 * 0.9, 0.25,
+                                   0.03 if inten == 1 else 0.034, decay=1.5),
+                        t0 + e * BEAT / 2)
         if inten >= 2:
             for q in range(4):
                 if q % 2 == 0:
@@ -230,32 +247,21 @@ def build(tl, path):
     from render import Ctx
     music_buf = music(tl)
     total = len(music_buf)
-    voice = np.zeros(total)
     fx = np.zeros(total)
     for it in tl.items:
-        x, sr = sf.read(os.path.join(tl.audio_dir, it["id"] + ".wav"))
-        assert sr == SR, sr
-        add(voice, x, it["start"] + 0.25)
         if it["start"] > 0:
-            add(fx, sfx("whoosh", seed=int(it["start"])) * 0.35,
+            add(fx, sfx("whoosh", seed=int(it["start"])) * 0.5,
                 it["start"] - 0.15)
     items = {it["id"]: it for it in tl.items}
     for k, (sid, cue, kind) in enumerate(SFX):
         it = items[sid]
         t = cue if isinstance(cue, float) else Ctx(it).at(cue)
-        add(fx, sfx(kind, seed=k) * 0.8, it["start"] + t)
-    # duck music under the voice
-    env = np.abs(voice)
-    win = int(0.25 * SR)
-    kern = np.ones(win) / win
-    env = np.convolve(env, kern, mode="same")
-    duck = 1.0 - 0.6 * np.clip(env / 0.03, 0, 1)
-    # fade out at the very end
+        add(fx, sfx(kind, seed=k), it["start"] + t)
     fade = np.ones(total)
-    n = int(2.0 * SR)
+    n = int(3.0 * SR)
     end = int(tl.total * SR)
     fade[end - n:end] = np.linspace(1, 0, n)
     fade[end:] = 0
-    mixb = voice * 1.0 + music_buf * duck * 0.45 * fade + fx * 0.5
-    mixb = np.tanh(mixb * 1.2) / 1.2
-    sf.write(path, mixb[:int(tl.total * SR)].astype(np.float32), SR)
+    mixb = music_buf * fade + fx * 0.6
+    mixb = np.tanh(mixb * 1.5) / 1.5
+    sf.write(path, mixb[:end].astype(np.float32), SR)
